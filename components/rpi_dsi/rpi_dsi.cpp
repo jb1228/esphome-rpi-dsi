@@ -19,31 +19,10 @@ void RpiDsi::setup() {
     return;
   }
 
-  esp_lcd_rpi_dsi_config_t config{};
-  config.i2c.bus = bus;
-  config.ldo_chan = 3;
-  config.ldo_voltage_mv = 2500;
-  config.dsi_bus_id = 0;
-  config.lane_bit_rate_mbps = 600;
-  config.dpi_clock_freq_mhz = 26;
-  config.timing = {
-      .h_size = WIDTH,
-      .v_size = HEIGHT,
-      .hsync_pulse_width = 2,
-      .hsync_back_porch = 46,
-      .hsync_front_porch = 210,
-      .vsync_pulse_width = 20,
-      .vsync_back_porch = 4,
-      .vsync_front_porch = 22,
-  };
-  config.brightness = this->brightness_;
-  config.flags.continuous_clock = true;
-  config.flags.non_burst_video = true;
-  config.flags.disable_lp = false;
-  config.flags.enable_touch = false;
-  config.flags.use_dma2d = false;
+  this->config_.i2c.bus = bus;
+  this->config_.brightness = this->brightness_;
 
-  err = esp_lcd_rpi_dsi_start(&config, &this->driver_);
+  err = esp_lcd_rpi_dsi_start(&this->config_, &this->driver_);
   if (err != ESP_OK) {
     this->fail_(LOG_STR("Display initialization failed"), err);
     return;
@@ -115,8 +94,9 @@ void RpiDsi::flush_() {
   if (!this->dirty_ || this->framebuffer_ == nullptr)
     return;
 
-  // The driver owns an aligned framebuffer; the fixed full-frame size is also cache-line aligned.
-  auto err = esp_cache_msync(this->framebuffer_, FRAMEBUFFER_SIZE, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+  // The configured full-frame size may not be cache-line aligned.
+  auto err = esp_cache_msync(this->framebuffer_, this->get_framebuffer_size_(),
+                            ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
   if (err != ESP_OK) {
     this->fail_(LOG_STR("Framebuffer cache synchronization failed"), err);
     return;
@@ -125,11 +105,11 @@ void RpiDsi::flush_() {
 }
 
 int RpiDsi::get_width() {
-  return display::rotation_swaps_axes(this->rotation_) ? HEIGHT : WIDTH;
+  return display::rotation_swaps_axes(this->rotation_) ? this->get_height_internal() : this->get_width_internal();
 }
 
 int RpiDsi::get_height() {
-  return display::rotation_swaps_axes(this->rotation_) ? WIDTH : HEIGHT;
+  return display::rotation_swaps_axes(this->rotation_) ? this->get_width_internal() : this->get_height_internal();
 }
 
 void RpiDsi::draw_pixel_at(int x, int y, Color color) {
@@ -140,21 +120,21 @@ void RpiDsi::draw_pixel_at(int x, int y, Color color) {
   switch (this->rotation_) {
     case display::DISPLAY_ROTATION_90_DEGREES:
       std::swap(x, y);
-      x = WIDTH - x - 1;
+      x = this->get_width_internal() - x - 1;
       break;
     case display::DISPLAY_ROTATION_180_DEGREES:
-      x = WIDTH - x - 1;
-      y = HEIGHT - y - 1;
+      x = this->get_width_internal() - x - 1;
+      y = this->get_height_internal() - y - 1;
       break;
     case display::DISPLAY_ROTATION_270_DEGREES:
       std::swap(x, y);
-      y = HEIGHT - y - 1;
+      y = this->get_height_internal() - y - 1;
       break;
     default:
       break;
   }
 
-  auto *pixel = this->framebuffer_ + (y * WIDTH + x) * 3;
+  auto *pixel = this->framebuffer_ + (y * this->get_width_internal() + x) * 3;
   if (pixel[0] != color.b || pixel[1] != color.g || pixel[2] != color.r) {
     pixel[0] = color.b;
     pixel[1] = color.g;
@@ -171,7 +151,7 @@ void RpiDsi::fill(Color color) {
     Display::fill(color);
     return;
   }
-  for (size_t offset = 0; offset < FRAMEBUFFER_SIZE; offset += 3) {
+  for (size_t offset = 0; offset < this->get_framebuffer_size_(); offset += 3) {
     auto *pixel = this->framebuffer_ + offset;
     if (pixel[0] != color.b || pixel[1] != color.g || pixel[2] != color.r) {
       pixel[0] = color.b;
@@ -195,16 +175,16 @@ void RpiDsi::draw_pixels_internal(int x_start, int y_start, int w, int h, const 
     Display::draw_pixels_internal(x_start, y_start, w, h, ptr, bitness, big_endian, x_offset, y_offset, x_pad);
   } else {
     const int first_col = std::max(0, -x_start);
-    const int end_col = std::min(w, WIDTH - x_start);
+    const int end_col = std::min(w, this->get_width_internal() - x_start);
     const int first_row = std::max(0, -y_start);
-    const int end_row = std::min(h, HEIGHT - y_start);
+    const int end_row = std::min(h, this->get_height_internal() - y_start);
     if (first_col < end_col && first_row < end_row) {
       const size_t source_bytes_per_pixel = bitness == display::COLOR_BITNESS_565 ? 2 : 3;
       const size_t stride = static_cast<size_t>(x_offset + w + x_pad) * source_bytes_per_pixel;
       const size_t row_bytes = (end_col - first_col) * 3;
       for (int row = first_row; row < end_row; row++) {
         const auto *source = ptr + (y_offset + row) * stride + (x_offset + first_col) * source_bytes_per_pixel;
-        auto *destination = this->framebuffer_ + ((y_start + row) * WIDTH + x_start + first_col) * 3;
+        auto *destination = this->framebuffer_ + ((y_start + row) * this->get_width_internal() + x_start + first_col) * 3;
         if (bitness == display::COLOR_BITNESS_888) {
           if (std::memcmp(destination, source, row_bytes) != 0) {
             std::memcpy(destination, source, row_bytes);
@@ -233,12 +213,15 @@ void RpiDsi::draw_pixels_internal(int x_start, int y_start, int w, int h, const 
 }
 
 void RpiDsi::dump_config() {
-  LOG_DISPLAY("", "Hosyond RPi DSI", this);
+  LOG_DISPLAY("", "RPi DSI", this);
   ESP_LOGCONFIG(TAG,
-                "  Native size: 800x480, RGB888\n"
-                "  DSI: 1 lane at 600 Mbps, pixel clock 26 MHz\n"
+                "  Native size: %dx%d, RGB888\n"
+                "  DSI: 1 lane at %g Mbps, pixel clock %g MHz\n"
                 "  Framebuffer: borrowed from IDF, %u bytes",
-                static_cast<unsigned>(FRAMEBUFFER_SIZE));
+                this->get_width_internal(), this->get_height_internal(),
+                static_cast<double>(this->config_.lane_bit_rate_mbps),
+                static_cast<double>(this->config_.dpi_clock_freq_mhz),
+                static_cast<unsigned>(this->get_framebuffer_size_()));
 }
 
 }  // namespace esphome::rpi_dsi
