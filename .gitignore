@@ -1,0 +1,16 @@
+# macOS and Python cache files
+.DS_Store
+__pycache__/
+*.py[cod]
+
+# Local environments and generated firmware
+.venv/
+.esphome/
+.pio/
+build/
+
+# Local ESPHome credentials
+secrets.yaml
+
+# Separately checked-out ESP-IDF driver dependency
+/components/esp_lcd_rpi_dsi
